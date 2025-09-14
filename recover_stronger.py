@@ -640,7 +640,6 @@ def main():
 if __name__ == "__main__":
     main()
 
-
 """
 python3 recover_stronger.py --sigs signatures.jsonl --mutate-r --resign-check --check-r-from-k
 """
